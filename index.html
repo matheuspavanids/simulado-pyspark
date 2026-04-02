@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simulado PySpark — MBA Engenharia de Dados</title>
+<meta name="description" content="Simulado completo de PySpark: questões teóricas e desafios práticos de código com correção automática.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🎓</text></svg>">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #root { min-height: 100vh; }
+  body { background: #0c0e17; }
+  textarea:focus, input:focus { outline: none; border-color: #7c6cff !important; }
+  button:active { transform: scale(0.98); }
+  ::selection { background: rgba(124,108,255,0.3); }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #0c0e17; }
+  ::-webkit-scrollbar-thumb { background: #252845; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #7c6cff; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useRef, useEffect } = React;
+
+// ─── DATA ────────────────────────────────────────────────────────────────────
+
+const THEORY_QUESTIONS = [
+{
+id: “t1”, topic: “Execução e Memória”,
+question: “Você tem um job PySpark que faz groupBy → join → groupBy em sequência. O job falha com OOM no segundo groupBy. O cluster tem 10 executors com 8GB cada. Qual ação tem MAIOR probabilidade de resolver?”,
+options: [
+“Aumentar spark.executor.memory para 16GB”,
+“Aumentar spark.sql.shuffle.partitions de 200 para 2000”,
+“Adicionar .cache() após o primeiro groupBy”,
+“Trocar o join por broadcast join”
+],
+correct: 1,
+explanation: “OOM no shuffle geralmente indica partições muito grandes. Aumentar shuffle.partitions de 200→2000 reduz o tamanho de cada partição de ~(total/200) para ~(total/2000). Mais memória pode ajudar, mas não resolve a raiz. Cache não ajuda pois o problema está no segundo shuffle. Broadcast só funciona se um lado for pequeno.”
+},
+{
+id: “t2”, topic: “Data Skew”,
+question: “Seu join entre tabela de pedidos (500M linhas) e clientes (2M linhas) leva 3 horas. Ao investigar, você descobre que 40% dos pedidos pertencem a 5 clientes corporativos. Qual técnica resolve esse data skew?”,
+options: [
+“Usar broadcast join para a tabela de clientes”,
+“Aplicar salting: adicionar sufixo aleatório (0-N) na chave de join dos clientes grandes e replicar as linhas correspondentes”,
+“Aumentar o número de executors de 10 para 50”,
+“Converter as tabelas para formato Delta antes do join”
+],
+correct: 1,
+explanation: “Data skew concentra 40% dos dados em poucos tasks. Salting fragmenta as chaves problemáticas adicionando sufixo aleatório (ex: cliente_1_0, cliente_1_1, …, cliente_1_N) e replicando o lado menor N vezes, distribuindo a carga entre múltiplas partições. Broadcast poderia funcionar se coubesse na memória, mas a questão pede a técnica específica para skew. Mais executors não resolve pois as mesmas tasks ficariam sobrecarregadas.”
+},
+{
+id: “t3”, topic: “Catalyst e Plano de Execução”,
+question: “Analise o código:\n\ndf.filter(col(‘status’)==‘A’).join(dim, ‘id’).select(‘nome’,‘valor’).filter(col(‘valor’)>100)\n\nO Catalyst reorganiza para qual ordem de execução?”,
+options: [
+“Mantém a ordem exata escrita pelo desenvolvedor”,
+“filter(status) → filter(valor>100) → join → select (predicate pushdown antes do join)”,
+“join → filter(status) → filter(valor>100) → select”,
+“select → filter(status) → filter(valor>100) → join”
+],
+correct: 1,
+explanation: “O Catalyst aplica predicate pushdown: empurra AMBOS os filtros para antes do join, reduzindo drasticamente o volume de dados no shuffle. Também aplica column pruning no select, lendo apenas as colunas necessárias. A ordem escrita pelo dev é irrelevante — o Catalyst reescreve o plano lógico para o mais eficiente possível.”
+},
+{
+id: “t4”, topic: “Particionamento Avançado”,
+question: “Você tem uma tabela Delta de 2TB particionada por ‘data’ (diária) e ‘estado’ (27 UFs). Consultas típicas filtram por data + cidade. A query df.filter((col(‘data’)==‘2024-01-15’) & (col(‘cidade’)==‘SP-Capital’)) está lenta. Por quê?”,
+options: [
+“Delta Lake não suporta filtros compostos com AND”,
+“A coluna ‘cidade’ não é partição nem tem Z-ORDER, então o Spark faz full scan dentro da partição data+estado”,
+“O filtro por data deveria usar BETWEEN em vez de igualdade”,
+“Particionamento por estado com 27 valores causa too-many-small-files”
+],
+correct: 1,
+explanation: “Partition pruning elimina data ≠ 2024-01-15 e estado ≠ SP. Mas dentro da partição data=2024-01-15/estado=SP, o Spark precisa ler TODOS os arquivos porque ‘cidade’ não está no esquema de particionamento nem tem Z-ORDER/data skipping. Solução: OPTIMIZE com ZORDER BY (cidade) para colocar registros da mesma cidade fisicamente próximos, habilitando data skipping nos min/max statistics.”
+},
+{
+id: “t5”, topic: “Serialização e UDFs”,
+question: “Uma equipe implementou uma UDF Python para calcular distância geográfica Haversine e aplicou em 500M de linhas. O job que antes levava 20min passou para 6 horas. Qual é a causa RAIZ da degradação?”,
+options: [
+“A fórmula Haversine é computacionalmente pesada demais para Big Data”,
+“UDFs Python forçam serialização/deserialização row-by-row entre JVM e Python (overhead de SerDe), impedindo otimização pelo Catalyst e Tungsten”,
+“O Spark não paraleliza UDFs — elas rodam em uma única thread”,
+“Python é uma linguagem interpretada e sempre será lenta para cálculos matemáticos”
+],
+correct: 1,
+explanation: “UDFs Python tradicionais criam um processo Python separado por executor. Cada row é serializada da JVM → Python (pickle) → processada → serializada de volta. Isso: (1) impede vetorização pelo Tungsten, (2) bloqueia otimizações do Catalyst (UDF é caixa-preta), (3) adiciona overhead de IPC. Solução: usar Pandas UDF (vectorized) com @pandas_udf que processa batches de Arrow em vez de row-by-row, ou reescrever com funções nativas do Spark (sin, cos, asin, sqrt).”
+},
+{
+id: “t6”, topic: “Gerenciamento de Estado”,
+question: “Você tem um pipeline Structured Streaming que lê de Kafka e faz aggregation com watermark de 10 minutos. Após 30 dias, o checkpoint cresceu para 200GB e o restart do job leva 45 minutos. Qual é a estratégia correta?”,
+options: [
+“Deletar o checkpoint e reiniciar o job do zero”,
+“Reduzir o watermark de 10 para 2 minutos”,
+“O comportamento é esperado: checkpoints de stateful operations crescem com o estado. Deve-se configurar state cleanup policies e considerar rocksdb state backend”,
+“Migrar de Kafka para leitura de arquivos Parquet em batch”
+],
+correct: 2,
+explanation: “Aggregation stateful mantém estado de todas as chaves ativas no checkpoint. Com watermark de 10min, o Spark descarta estado de janelas expiradas, mas se houver muitas chaves distintas, o state store (HashMapStateStore padrão) cresce. RocksDB state backend é mais eficiente para estados grandes (usa disco + cache). Deletar checkpoint perde o estado e pode causar perda/duplicação de dados.”
+},
+{
+id: “t7”, topic: “Otimização de Joins”,
+question: “Considere: df_grande (800M linhas) LEFT JOIN df_medio (50M linhas) pela coluna ‘cliente_id’. spark.sql.autoBroadcastJoinThreshold está no padrão (10MB). O df_medio tem 2GB em memória. Qual é a MELHOR estratégia?”,
+options: [
+“Forçar broadcast com F.broadcast(df_medio) — 2GB cabe na memória do executor”,
+“Usar Sort-Merge Join padrão e aumentar shuffle partitions”,
+“Fazer bucket join: salvar ambas as tabelas bucketizadas por ‘cliente_id’ com o mesmo número de buckets, eliminando shuffle no join”,
+“Particionar df_grande por ‘cliente_id’ antes do join”
+],
+correct: 2,
+explanation: “Broadcast de 2GB é arriscado (cada executor precisa de cópia + overhead). Sort-Merge funciona mas shuffle de 800M linhas é caro. Bucket join é ideal para joins recorrentes: ao salvar ambas as tabelas com .bucketBy(N, ‘cliente_id’).sortBy(‘cliente_id’).saveAsTable(), os dados já ficam co-localizados por chave. Joins subsequentes não precisam de shuffle, pois partições com mesmo bucket já estão alinhadas. Tradeoff: custo único de escrita bucketed vs ganho em todos os joins futuros.”
+},
+{
+id: “t8”, topic: “Execução Física”,
+question: “No Spark UI, você observa que um stage tem 200 tasks, mas apenas 3 tasks levam 45 minutos enquanto as outras 197 terminam em 30 segundos. O que este padrão indica e qual métrica confirma?”,
+options: [
+“Hardware defeituoso nos nodes — verificar no YARN/Kubernetes logs”,
+“Data skew — confirmar na aba ‘Summary Metrics’ comparando P50 vs P99 de ‘Shuffle Read Size’ e ‘Duration’”,
+“Speculative execution está desabilitada — ativar spark.speculation=true resolve”,
+“O número de partições (200) é muito baixo — aumentar para 2000”
+],
+correct: 1,
+explanation: “3 tasks lentas entre 200 é assinatura clássica de data skew: partições desbalanceadas onde poucas chaves concentram volume desproporcional. No Spark UI → Stage → Summary Metrics: se P50 shuffle read é 50MB mas P99 é 15GB, confirma skew. Speculative execution pode ajudar marginalmente (re-lança tasks lentas) mas não resolve a raiz. Aumentar partições pode diluir, mas se a skew é em uma chave específica, a chave continua indo para uma única partição.”
+},
+{
+id: “t9”, topic: “Arquitetura Lakehouse”,
+question: “Em um Delta Lake, você executa UPDATE em 5% das linhas de uma tabela com 10TB. Após o update, o tamanho no storage DOBROU para 20TB. Isso é um bug?”,
+options: [
+“Sim, Delta Lake tem um bug de duplicação em updates parciais”,
+“Não. Delta usa copy-on-write: reescreve os arquivos Parquet inteiros que contêm linhas modificadas e mantém versões antigas para time travel. Executar VACUUM remove versões antigas”,
+“Não. Mas indica que a tabela deveria estar particionada diferentemente”,
+“Sim. O update deveria ser feito com MERGE INTO para evitar duplicação”
+],
+correct: 1,
+explanation: “Delta Lake é append-only no storage. UPDATE/DELETE/MERGE usam copy-on-write: localizam os arquivos Parquet afetados, reescrevem-nos integralmente com as modificações, e registram no transaction log (_delta_log). Arquivos antigos ficam para time travel e audit. VACUUM(retentionHours) remove versões antigas. Se 5% das linhas estão espalhadas em muitos arquivos, quase toda a tabela é reescrita. OPTIMIZE + ZORDER minimiza isso agrupando dados relacionados nos mesmos arquivos.”
+},
+{
+id: “t10”, topic: “Tuning de Produção”,
+question: “Um pipeline PySpark em produção tem o seguinte padrão:\n\ndf = spark.read.parquet(‘s3://big-table’)\ndf.cache()\ndf.count()  # materializa cache\nresult1 = df.groupBy(‘a’).agg(…)\nresult2 = df.groupBy(‘b’).agg(…)\nresult3 = df.join(other_df, …)\n\nO DataFrame tem 500GB. O cluster tem 10 executors × 16GB = 160GB total. O que acontece?”,
+options: [
+“O cache funciona perfeitamente, os 500GB ficam distribuídos entre os 10 executors”,
+“O .cache() tenta armazenar 500GB em 160GB de memória, causa spill para disco massivo, pressão de GC, e possivelmente OOM. Melhor usar .persist(StorageLevel.DISK_ONLY) ou eliminar cache e ler do Parquet 3 vezes (com predicate pushdown pode ser mais rápido)”,
+“O Spark automaticamente faz cache parcial — guarda o que cabe e relê o resto do disco”,
+“O count() após cache é desnecessário — o Spark materializa o cache automaticamente no primeiro uso”
+],
+correct: 1,
+explanation: “cache() = persist(MEMORY_AND_DISK). Com 500GB para 160GB, ~340GB vai para disco local (serializado). O Spark SIM faz spill para disco, mas com overhead significativo: serialização, I/O de disco local, e pressão no garbage collector (o cache em memória compete com memória de execução). Em muitos casos, reler Parquet colunar do S3 3x (com column pruning e predicate pushdown otimizados pelo Catalyst) é mais rápido que manter cache parcial. Alternativa: persist(DISK_ONLY) evita pressão de GC.”
+},
+{
+id: “t11”, topic: “Segurança de Tipos”,
+question: “Analise:\n\ndf = spark.read.csv(‘data.csv’, header=True)\ndf_filtered = df.filter(col(‘preco’) > 100)\n\nA query retorna 0 linhas, mas você sabe que há preços acima de 100. O que aconteceu?”,
+options: [
+“O arquivo CSV está corrompido”,
+“CSV sem inferSchema=True lê todas as colunas como StringType. A comparação ‘250’ > 100 compara string com int, resultando em comportamento inesperado. Solução: inferSchema=True ou definir schema explícito”,
+“O filtro deveria usar >= em vez de >”,
+“O header=True causa conflito com a primeira linha de dados”
+],
+correct: 1,
+explanation: “Sem inferSchema=True, spark.read.csv lê TUDO como StringType. col(‘preco’) > 100 faz cast implícito inconsistente — comparação string vs int em Spark pode retornar NULL (que é filtrado como false). Armadilha clássica em produção. Soluções: (1) inferSchema=True (lento para arquivos grandes pois faz 2 passagens), (2) definir StructType explícito, (3) usar .cast() explícito após leitura. Em produção, SEMPRE defina schema explícito.”
+},
+{
+id: “t12”, topic: “Controle de Concorrência”,
+question: “Dois pipelines Spark tentam escrever na mesma tabela Delta simultaneamente: Pipeline A faz INSERT de novos registros, Pipeline B faz UPDATE em registros existentes. O que acontece?”,
+options: [
+“Um dos pipelines falha com erro de lock do filesystem”,
+“Os dados ficam corrompidos pois Parquet não suporta escrita concorrente”,
+“Delta Lake usa optimistic concurrency control via transaction log. Se não tocam nos mesmos arquivos, ambos sucedem. Se conflitam, o segundo falha com ConcurrentModificationException e deve ser retentado”,
+“Delta Lake usa pessimistic locking — o segundo pipeline aguarda o primeiro terminar”
+],
+correct: 2,
+explanation: “Delta Lake implementa ACID via optimistic concurrency: cada operação tenta commit atômico no _delta_log (arquivo JSON numerado sequencialmente). No commit, verifica se os arquivos que leu/modificou foram alterados por outra transação. INSERT vs UPDATE em dados diferentes geralmente não conflita (isolation level padrão = Serializable para writes). Se conflitar, o commit falha e o pipeline deve retry. Isso é fundamentalmente diferente de databases tradicionais que usam locks.”
+}
+];
+
+const CODE_CHALLENGES = [
+{
+id: “c1”,
+title: “Pipeline SCD Type 2 — Slowly Changing Dimension”,
+points: 20,
+description: `Você tem um DataFrame ‘df_atual’ com os clientes vigentes e ‘df_novos’ com atualizações recebidas hoje.
+
+df_atual: (cliente_id, nome, cidade, vigencia_inicio, vigencia_fim, is_current)
+df_novos: (cliente_id, nome, cidade)
+
+Implemente a lógica SCD Type 2:
+a) Identifique registros que MUDARAM (join + comparação de nome ou cidade)
+b) Para registros alterados: feche o registro antigo (vigencia_fim = data_hoje, is_current = False)
+c) Insira novo registro com dados atualizados (vigencia_inicio = data_hoje, vigencia_fim = null, is_current = True)
+d) Mantenha registros sem mudança inalterados
+e) Una tudo em ‘df_scd2_final’
+
+Use a variável ‘data_hoje’ = ‘2024-06-15’ (já disponível).`, starterCode: `from pyspark.sql import functions as F
+
+data_hoje = ‘2024-06-15’
+
+# a) Identificar mudanças via left join
+
+df_joined = df_atual.filter(F.col(“is_current”) == True).alias(“old”).join(
+df_novos.alias(“new”),
+# SEU CÓDIGO AQUI — condição de join
+)
+
+# b) Detectar registros que mudaram
+
+df_changed = df_joined.filter(
+# SEU CÓDIGO AQUI — comparar old vs new (nome OU cidade diferente)
+)
+
+# c) Fechar registros antigos (atualizar vigencia_fim e is_current)
+
+df_fechados = df_changed.select(
+# SEU CÓDIGO AQUI — selecionar colunas do ‘old’ com vigencia_fim = data_hoje, is_current = False
+)
+
+# d) Novos registros vigentes
+
+df_novos_vigentes = df_changed.select(
+# SEU CÓDIGO AQUI — selecionar colunas do ‘new’ com vigencia_inicio = data_hoje, vigencia_fim = null, is_current = True
+)
+
+# e) Registros sem mudança
+
+df_sem_mudanca = df_atual.join(
+df_changed.select(F.col(“old.cliente_id”)),
+# SEU CÓDIGO AQUI — anti join para pegar quem NÃO mudou
+)
+
+# f) União final
+
+df_scd2_final = df_sem_mudanca.unionByName(df_fechados).unionByName(df_novos_vigentes)
+df_scd2_final.orderBy(“cliente_id”, “vigencia_inicio”).show(truncate=False)`, solution: `Join por cliente_id, filter com (old.nome != new.nome) | (old.cidade != new.cidade), fechamento com withColumn vigencia_fim=lit(data_hoje) e is_current=lit(False), novos com vigencia_inicio=lit(data_hoje) vigencia_fim=lit(None) is_current=lit(True), anti join com how=‘left_anti’, unionByName final`, checkHints: ["cliente_id", "is_current", "vigencia_fim", "vigencia_inicio", "lit", "left_anti", "unionByName", "!=", "alias"] }, { id: "c2", title: "Deduplicação Avançada com Window + Qualidade de Dados", points: 20, description: `DataFrame ‘df_raw’ com registros potencialmente duplicados de um sistema transacional:
+(transaction_id, cliente_id, produto, valor, timestamp, source_system)
+
+Múltiplos source_systems podem enviar o mesmo transaction_id. Regras:
+a) Deduplicar por transaction_id, mantendo o registro mais recente (maior timestamp)
+b) Em caso de empate no timestamp, priorizar source_system na ordem: ‘SAP’ > ‘LEGACY’ > ‘MANUAL’
+c) Adicionar colunas de qualidade: ‘has_null’ (boolean: alguma coluna é null), ‘duplicata_count’ (quantas vezes o transaction_id apareceu nos dados brutos)
+d) Salvar resultado limpo em ‘df_clean’ e registros removidos em ‘df_rejected’`, starterCode: `from pyspark.sql import functions as F
+from pyspark.sql import Window
+
+# a) Contar duplicatas por transaction_id
+
+df_with_count = df_raw.withColumn(
+“duplicata_count”,
+# SEU CÓDIGO AQUI — count over window particionada por transaction_id
+)
+
+# b) Prioridade de source_system
+
+df_with_priority = df_with_count.withColumn(
+“source_priority”,
+# SEU CÓDIGO AQUI — CASE WHEN: SAP=1, LEGACY=2, MANUAL=3, ELSE=99
+)
+
+# c) Window para ranking: ordenar por timestamp DESC, source_priority ASC
+
+w = Window.partitionBy(“transaction_id”).orderBy(
+# SEU CÓDIGO AQUI
+)
+df_ranked = df_with_priority.withColumn(“rn”, F.row_number().over(w))
+
+# d) Coluna de qualidade: has_null
+
+df_quality = df_ranked.withColumn(
+“has_null”,
+# SEU CÓDIGO AQUI — verificar se QUALQUER coluna original é null
+)
+
+# e) Separar clean e rejected
+
+df_clean = df_quality.filter(
+# SEU CÓDIGO AQUI
+).drop(“rn”, “source_priority”)
+
+df_rejected = df_quality.filter(
+# SEU CÓDIGO AQUI
+).drop(“rn”, “source_priority”)
+
+df_clean.show(truncate=False)`, solution: `count().over(Window.partitionBy(“transaction_id”)), F.when(col(“source_system”)==“SAP”,1).when(…“LEGACY”,2).when(…“MANUAL”,3).otherwise(99), orderBy(col(“timestamp”).desc(), col(“source_priority”).asc()), has_null com reduce/or de isnull para cada coluna, filter(rn==1) para clean e filter(rn>1) para rejected`, checkHints: ["partitionBy", "transaction_id", "row_number", "when", "SAP", "LEGACY", "source_priority", "timestamp", "desc", "isnull", "rn"] }, { id: "c3", title: "Análise de Funil com Window Functions Encadeadas", points: 20, description: `DataFrame ‘df_events’ de um e-commerce com eventos de usuário:
+(user_id, event_type, event_timestamp, session_id, page_url, valor_carrinho)
+
+event_types possíveis: ‘page_view’, ‘add_to_cart’, ‘checkout_start’, ‘purchase’
+
+Construa a análise de funil:
+a) Para cada user_id e session_id, ordene eventos por timestamp
+b) Calcule ‘tempo_entre_etapas’ (diferença em SEGUNDOS entre evento atual e o anterior do mesmo user+session), usando lag()
+c) Identifique ‘abandonou_carrinho’: flag True se o usuário tem ‘add_to_cart’ mas NÃO tem ‘purchase’ na mesma sessão
+d) Calcule métricas agregadas por etapa do funil: total_usuarios, taxa_conversao_pct (em relação à etapa anterior)`, starterCode: `from pyspark.sql import functions as F
+from pyspark.sql import Window
+
+# a) Window por user + session ordenada por timestamp
+
+w_session = Window.partitionBy(
+# SEU CÓDIGO AQUI
+).orderBy(“event_timestamp”)
+
+# b) Tempo entre etapas com lag
+
+df_with_lag = df_events.withColumn(
+“prev_timestamp”,
+# SEU CÓDIGO AQUI — lag do event_timestamp
+).withColumn(
+“tempo_entre_etapas”,
+# SEU CÓDIGO AQUI — diferença em segundos (use F.unix_timestamp)
+)
+
+# c) Identificar abandono de carrinho por sessão
+
+w_full_session = Window.partitionBy(“user_id”, “session_id”)
+
+df_with_funnel = df_with_lag.withColumn(
+“session_has_cart”,
+# SEU CÓDIGO AQUI — max/collect: sessão contém ‘add_to_cart’?
+).withColumn(
+“session_has_purchase”,
+# SEU CÓDIGO AQUI — sessão contém ‘purchase’?
+).withColumn(
+“abandonou_carrinho”,
+# SEU CÓDIGO AQUI — has_cart AND NOT has_purchase
+)
+
+# d) Métricas de funil: contar usuários distintos por etapa
+
+df_funil = df_events.groupBy(“event_type”).agg(
+# SEU CÓDIGO AQUI — countDistinct de user_id como total_usuarios
+)
+
+# Calcular taxa de conversão vs etapa anterior (dica: use lag sobre o df_funil ordenado)
+
+# SEU CÓDIGO AQUI
+
+df_funil.show(truncate=False)`, solution: `partitionBy user_id session_id, lag(event_timestamp 1).over(w_session), unix_timestamp(current) - unix_timestamp(prev), F.max(F.when(col(“event_type”)==“add_to_cart”,1).otherwise(0)).over(w_full_session), same para purchase, col(“session_has_cart”)==1 & col(“session_has_purchase”)==0, countDistinct user_id, lag para taxa de conversão`, checkHints: ["partitionBy", "user_id", "session_id", "lag", "unix_timestamp", "tempo_entre_etapas", "add_to_cart", "purchase", "countDistinct", "abandonou"] }, { id: "c4", title: "Spark SQL Complexo — Cohort Analysis com CTEs", points: 20, description: `Usando Spark SQL (não DataFrame API), escreva uma query de Cohort Analysis.
+
+Views disponíveis: ‘compras’ (user_id, data_compra, valor) e ‘usuarios’ (user_id, data_cadastro)
+
+A query deve:
+a) Usar CTEs (WITH) para organizar
+b) CTE ‘primeira_compra’: data da primeira compra de cada usuário
+c) CTE ‘cohort’: mês de cadastro como cohort_month, e calcular meses_desde_cadastro para cada compra
+d) Resultado final: para cada cohort_month e meses_desde_cadastro (0,1,2,3…), calcular:
+
+- usuarios_ativos (distintos)
+- receita_total
+- retention_pct (usuarios_ativos / total do cohort no mês 0 * 100)
+  e) Ordenar por cohort_month, meses_desde_cadastro`,     starterCode: `df_cohort = spark.sql(”””
+  WITH primeira_compra AS (
+  – SEU CÓDIGO AQUI
+  – Menor data_compra por user_id
+  ),
+  cohort_base AS (
+  – SEU CÓDIGO AQUI
+  – Join usuarios + compras
+  – Calcular cohort_month (DATE_TRUNC(‘month’, data_cadastro))
+  – Calcular meses_desde_cadastro (MONTHS_BETWEEN)
+  ),
+  cohort_size AS (
+  – SEU CÓDIGO AQUI
+  – Total de usuários únicos no mês 0 de cada cohort
+  )
+  – SEU CÓDIGO AQUI
+  – SELECT final com join entre cohort_base aggregado e cohort_size
+  – Calcular retention_pct
+  – ORDER BY cohort_month, meses_desde_cadastro
+  “””)
+
+df_cohort.show(50, truncate=False)`, solution: `WITH primeira_compra AS (SELECT user_id, MIN(data_compra) FROM compras GROUP BY user_id), cohort_base com JOIN entre usuarios e compras, DATE_TRUNC(‘month’, data_cadastro) as cohort_month, FLOOR(MONTHS_BETWEEN(data_compra, data_cadastro)) as meses_desde_cadastro, cohort_size com COUNT(DISTINCT user_id) WHERE meses_desde_cadastro=0 GROUP BY cohort_month, SELECT final com groupBy cohort_month+meses_desde_cadastro, COUNT DISTINCT user_id, SUM valor, join com cohort_size para retention_pct`,
+checkHints: [“WITH”, “MIN(”, “DATE_TRUNC”, “MONTHS_BETWEEN”, “cohort_month”, “meses_desde_cadastro”, “COUNT(DISTINCT”, “retention”, “GROUP BY”, “ORDER BY”, “JOIN”]
+}
+];
+
+// ─── STYLES ──────────────────────────────────────────────────────────────────
+
+const C = {
+bg: “#0c0e17”, bgAlt: “#111425”,
+card: “#161932”, cardHover: “#1c2040”,
+accent: “#7c6cff”, accentSoft: “rgba(124,108,255,0.12)”,
+accentGlow: “rgba(124,108,255,0.25)”,
+green: “#34d399”, greenSoft: “rgba(52,211,153,0.1)”, greenBorder: “rgba(52,211,153,0.3)”,
+red: “#f87171”, redSoft: “rgba(248,113,113,0.1)”, redBorder: “rgba(248,113,113,0.3)”,
+amber: “#fbbf24”, amberSoft: “rgba(251,191,36,0.1)”,
+text: “#e4e2f0”, muted: “#7a78a0”, dim: “#4a4870”,
+border: “#252845”,
+codeBg: “#0d0f1a”, codeFont: “‘JetBrains Mono’,‘Fira Code’,‘Cascadia Code’,monospace”,
+};
+
+const font = “‘Outfit’,‘DM Sans’,‘Inter’,system-ui,sans-serif”;
+
+// ─── COMPONENTS ──────────────────────────────────────────────────────────────
+
+function Pill({ children, color = C.accent, bg = C.accentSoft }) {
+return (
+<span style={{
+fontSize: 10, fontWeight: 700, letterSpacing: 1.2, textTransform: “uppercase”,
+color, background: bg, padding: “4px 10px”, borderRadius: 20, whiteSpace: “nowrap”,
+}}>{children}</span>
+);
+}
+
+function SectionBadge({ number, label, active }) {
+return (
+<div style={{
+display: “flex”, alignItems: “center”, gap: 10, padding: “10px 16px”,
+borderRadius: 10, cursor: “pointer”,
+background: active ? C.accentSoft : “transparent”,
+border: `1px solid ${active ? C.accent : C.border}`,
+transition: “all 0.2s”,
+}}>
+<span style={{
+width: 28, height: 28, borderRadius: “50%”,
+display: “flex”, alignItems: “center”, justifyContent: “center”,
+fontSize: 13, fontWeight: 800,
+background: active ? C.accent : C.border,
+color: active ? “#fff” : C.muted,
+}}>{number}</span>
+<span style={{ fontSize: 13, fontWeight: 600, color: active ? C.text : C.muted }}>{label}</span>
+</div>
+);
+}
+
+// ─── MAIN APP ────────────────────────────────────────────────────────────────
+
+function App() {
+const [screen, setScreen] = useState(“intro”); // intro | exam | results
+const [section, setSection] = useState(“theory”); // theory | code
+const [name, setName] = useState(””);
+const [theoryAnswers, setTheoryAnswers] = useState({});
+const [codeAnswers, setCodeAnswers] = useState(() => {
+const init = {};
+CODE_CHALLENGES.forEach(c => { init[c.id] = c.starterCode; });
+return init;
+});
+const [codeEvals, setCodeEvals] = useState({});
+const [evaluating, setEvaluating] = useState({});
+const [allEvaluated, setAllEvaluated] = useState(false);
+
+// Theory score
+const theoryScore = THEORY_QUESTIONS.reduce((a, q) => a + (theoryAnswers[q.id] === q.correct ? 1 : 0), 0);
+const theoryAnswered = Object.keys(theoryAnswers).length;
+const theoryTotal = THEORY_QUESTIONS.length;
+const theoryPct = Math.round((theoryScore / theoryTotal) * 100);
+
+// Code score
+const codeMaxPoints = CODE_CHALLENGES.reduce((a, c) => a + c.points, 0);
+const codeEarnedPoints = Object.values(codeEvals).reduce((a, ev) => a + (ev?.points || 0), 0);
+
+// Combined
+const combinedPct = Math.round(((theoryScore / theoryTotal) * 40 + (codeEarnedPoints / codeMaxPoints) * 60));
+
+// ─── DETERMINISTIC CODE EVALUATOR ──────────────────────────────────────────
+// Each challenge has test cases: regex patterns that check specific code constructs.
+// Each test has points and a description. Total points per challenge = challenge.points.
+
+const TEST_SUITES = {
+c1: [
+{ pts: 2, name: “Join por cliente_id”, test: (c) => /join\s*([\s\S]*cliente_id/i.test(c) },
+{ pts: 2, name: “Alias ‘old’ e ‘new’”, test: (c) => /alias\s*(\s*[”’]old[”’]\s*)/i.test(c) && /alias\s*(\s*[”’]new[”’]\s*)/i.test(c) },
+{ pts: 3, name: “Detecção de mudança (!=)”, test: (c) => /old.(nome|cidade)\s*)\s*!=\s*.*new.(nome|cidade)/i.test(c) || /!=.*col\s*(\s*[”’]new./i.test(c) },
+{ pts: 2, name: “Operador OR (|) entre condições”, test: (c) => /|\s*(/.test(c) || /)\s*|/.test(c) },
+{ pts: 3, name: “Fechamento com lit(data_hoje) em vigencia_fim”, test: (c) => /lit\s*(\s*data_hoje\s*)/.test(c) && /vigencia_fim/i.test(c) },
+{ pts: 2, name: “is_current = False no fechamento”, test: (c) => /lit\s*(\s*False\s*)/.test(c) && /is_current/i.test(c) },
+{ pts: 2, name: “Novos registros com is_current = True”, test: (c) => /lit\s*(\s*True\s*)/.test(c) },
+{ pts: 2, name: “Anti join (left_anti)”, test: (c) => /left_anti|leftanti/i.test(c) },
+{ pts: 2, name: “unionByName final”, test: (c) => (c.match(/unionByName/gi) || []).length >= 2 },
+],
+c2: [
+{ pts: 2, name: “Window particionada por transaction_id”, test: (c) => /partitionBy\s*(\s*[”’]transaction_id[”’]\s*)/i.test(c) },
+{ pts: 2, name: “Count over window (duplicata_count)”, test: (c) => /count\s*(\s*).over|F.count/i.test(c) && /duplicata_count/i.test(c) },
+{ pts: 3, name: “CASE WHEN para prioridade (SAP=1, LEGACY=2, MANUAL=3)”, test: (c) => {
+return /when\s*(.*SAP/i.test(c) && /when\s*(.*LEGACY/i.test(c) && /when\s*(.*MANUAL/i.test(c);
+}},
+{ pts: 2, name: “Valores de prioridade corretos (1, 2, 3)”, test: (c) => /SAP[\s\S]{0,20}1/i.test(c) && /LEGACY[\s\S]{0,20}2/i.test(c) && /MANUAL[\s\S]{0,20}3/i.test(c) },
+{ pts: 2, name: “OrderBy timestamp DESC + priority ASC”, test: (c) => /timestamp[\s\S]{0,30}desc/i.test(c) && /priority[\s\S]{0,30}asc/i.test(c) },
+{ pts: 2, name: “row_number().over()”, test: (c) => /row_number\s*(\s*)\s*.over/i.test(c) },
+{ pts: 3, name: “Detecção de nulls (isnull)”, test: (c) => /isnull|isNull|is_null/i.test(c) },
+{ pts: 2, name: “Filtro rn == 1 (clean)”, test: (c) => /rn[’”]\s*)\s*==\s*1|==\s*1/i.test(c) && /clean/i.test(c) },
+{ pts: 2, name: “Filtro rn > 1 (rejected)”, test: (c) => /rn[’”]\s*)\s*>\s*1|>\s*1/i.test(c) && /rejected/i.test(c) },
+],
+c3: [
+{ pts: 2, name: “Window por user_id + session_id”, test: (c) => /partitionBy\s*([\s\S]*user_id[\s\S]*session_id/i.test(c) || /partitionBy\s*([\s\S]*session_id[\s\S]*user_id/i.test(c) },
+{ pts: 2, name: “OrderBy event_timestamp”, test: (c) => /orderBy\s*(\s*[”’]event_timestamp/i.test(c) },
+{ pts: 3, name: “lag() no event_timestamp”, test: (c) => /lag\s*([\s\S]*event_timestamp/i.test(c) || /lag\s*([\s\S]*timestamp/i.test(c) },
+{ pts: 3, name: “Cálculo de diferença com unix_timestamp”, test: (c) => /unix_timestamp/i.test(c) && /tempo_entre/i.test(c) },
+{ pts: 3, name: “Detecção de add_to_cart na sessão”, test: (c) => /when\s*([\s\S]*add_to_cart/i.test(c) || /==\s*[”’]add_to_cart/i.test(c) },
+{ pts: 3, name: “Detecção de purchase na sessão”, test: (c) => /when\s*([\s\S]*purchase/i.test(c) || /==\s*[”’]purchase/i.test(c) },
+{ pts: 2, name: “Flag abandonou_carrinho (has_cart AND NOT has_purchase)”, test: (c) => /abandonou/i.test(c) && /has_cart|session_has_cart/i.test(c) },
+{ pts: 2, name: “countDistinct de user_id no funil”, test: (c) => /countDistinct|count_distinct/i.test(c) && /user_id/i.test(c) },
+],
+c4: [
+{ pts: 2, name: “Uso de CTEs (WITH … AS)”, test: (c) => /WITH\s+\w+\s+AS\s*(/i.test(c) },
+{ pts: 2, name: “CTE primeira_compra com MIN(data_compra)”, test: (c) => /primeira_compra[\s\S]*MIN\s*(\s*data_compra\s*)/i.test(c) },
+{ pts: 2, name: “GROUP BY user_id na primeira_compra”, test: (c) => /primeira_compra[\s\S]*GROUP\s+BY\s+[\s\S]*user_id/i.test(c) },
+{ pts: 2, name: “DATE_TRUNC para cohort_month”, test: (c) => /DATE_TRUNC\s*(\s*[’”]month[’”]/i.test(c) && /cohort_month/i.test(c) },
+{ pts: 3, name: “MONTHS_BETWEEN para meses_desde_cadastro”, test: (c) => /MONTHS_BETWEEN/i.test(c) && /meses_desde_cadastro/i.test(c) },
+{ pts: 2, name: “JOIN entre tabelas (usuarios + compras)”, test: (c) => /JOIN[\s\S]*compras|JOIN[\s\S]*usuarios/i.test(c) },
+{ pts: 2, name: “COUNT(DISTINCT user_id) como usuarios_ativos”, test: (c) => /COUNT\s*(\s*DISTINCT\s+user_id\s*)/i.test(c) },
+{ pts: 2, name: “Cálculo de retention_pct”, test: (c) => /retention/i.test(c) && /*\s*100|/ ?\w+[\s\S]{0,20}*\s*100/i.test(c) },
+{ pts: 3, name: “ORDER BY cohort_month, meses_desde_cadastro”, test: (c) => /ORDER\s+BY[\s\S]*cohort_month[\s\S]*meses_desde/i.test(c) },
+],
+};
+
+const evaluateCode = useCallback((challengeId) => {
+const challenge = CODE_CHALLENGES.find(c => c.id === challengeId);
+const studentCode = codeAnswers[challengeId];
+const suite = TEST_SUITES[challengeId];
+
+```
+setEvaluating(prev => ({ ...prev, [challengeId]: true }));
+
+// Check if code is untouched
+const hasPlaceholder = studentCode.includes("SEU CÓDIGO AQUI");
+const codeStripped = studentCode.replace(/\s+|#.*$/gm, "");
+const starterStripped = challenge.starterCode.replace(/\s+|#.*$/gm, "");
+const isUnchanged = codeStripped === starterStripped;
+
+if (hasPlaceholder || isUnchanged) {
+  setCodeEvals(prev => ({
+    ...prev,
+    [challengeId]: {
+      points: 0,
+      status: "incorreto",
+      feedback: "O código não foi preenchido. Substitua os blocos '# SEU CÓDIGO AQUI' pela sua solução.",
+      testResults: suite.map(t => ({ ...t, passed: false })),
+    }
+  }));
+  setEvaluating(prev => ({ ...prev, [challengeId]: false }));
+  return;
+}
+
+// Run each test
+const results = suite.map(t => ({
+  name: t.name,
+  pts: t.pts,
+  passed: t.test(studentCode),
+}));
+
+const earned = results.filter(r => r.passed).reduce((a, r) => a + r.pts, 0);
+const total = results.reduce((a, r) => a + r.pts, 0);
+const ratio = earned / total;
+
+const passed = results.filter(r => r.passed).map(r => r.name);
+const failed = results.filter(r => !r.passed).map(r => r.name);
+
+let feedback;
+if (ratio >= 0.9) {
+  feedback = `Excelente! ${passed.length}/${results.length} verificações passaram.`;
+} else if (ratio >= 0.6) {
+  feedback = `Bom progresso (${passed.length}/${results.length}). Faltam: ${failed.slice(0, 3).join("; ")}.`;
+} else {
+  feedback = `${passed.length}/${results.length} verificações. Revise: ${failed.slice(0, 3).join("; ")}.`;
+}
+
+setCodeEvals(prev => ({
+  ...prev,
+  [challengeId]: {
+    points: earned,
+    status: ratio >= 0.9 ? "correto" : ratio >= 0.5 ? "parcial" : "incorreto",
+    feedback,
+    testResults: results,
+  }
+}));
+setEvaluating(prev => ({ ...prev, [challengeId]: false }));
+```
+
+}, [codeAnswers]);
+
+const evaluateAll = useCallback(() => {
+for (const c of CODE_CHALLENGES) {
+evaluateCode(c.id);
+}
+setAllEvaluated(true);
+}, [evaluateCode]);
+
+const canFinish = theoryAnswered === theoryTotal;
+
+const submitExam = () => {
+evaluateAll();
+setScreen(“results”);
+};
+
+const resetAll = () => {
+setTheoryAnswers({});
+const init = {};
+CODE_CHALLENGES.forEach(c => { init[c.id] = c.starterCode; });
+setCodeAnswers(init);
+setCodeEvals({});
+setEvaluating({});
+setAllEvaluated(false);
+setSection(“theory”);
+setScreen(“exam”);
+};
+
+// ─── INTRO ──────────────────────────────────────────────────────────────────
+
+if (screen === “intro”) {
+return (
+<div style={{ fontFamily: font, background: C.bg, color: C.text, minHeight: “100vh”, padding: 24 }}>
+<div style={{ maxWidth: 520, margin: “0 auto”, paddingTop: 60, textAlign: “center” }}>
+<div style={{ fontSize: 18, marginBottom: 6, opacity: 0.6 }}>🎓</div>
+<div style={{
+fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: “uppercase”,
+color: C.accent, marginBottom: 20,
+}}>
+MBA · Engenharia de Dados
+</div>
+<h1 style={{ fontSize: 28, fontWeight: 800, lineHeight: 1.2, margin: “0 0 8px” }}>
+Simulado PySpark
+</h1>
+<p style={{ fontSize: 14, color: C.muted, lineHeight: 1.7, margin: “0 0 8px” }}>
+Prova completa: teórica + prática
+</p>
+<div style={{ display: “flex”, gap: 16, justifyContent: “center”, margin: “20px 0 36px”, flexWrap: “wrap” }}>
+<div style={{
+background: C.card, borderRadius: 10, padding: “12px 20px”,
+border: `1px solid ${C.border}`, textAlign: “center”, minWidth: 120,
+}}>
+<div style={{ fontSize: 20, fontWeight: 800, color: C.accent }}>12</div>
+<div style={{ fontSize: 11, color: C.muted }}>Questões teóricas</div>
+<div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>Peso 40%</div>
+</div>
+<div style={{
+background: C.card, borderRadius: 10, padding: “12px 20px”,
+border: `1px solid ${C.border}`, textAlign: “center”, minWidth: 120,
+}}>
+<div style={{ fontSize: 20, fontWeight: 800, color: C.green }}>4</div>
+<div style={{ fontSize: 11, color: C.muted }}>Desafios de código</div>
+<div style={{ fontSize: 10, color: C.dim, marginTop: 2 }}>Peso 60%</div>
+</div>
+</div>
+
+```
+      <input
+        type="text" placeholder="Seu nome completo" value={name}
+        onChange={e => setName(e.target.value)}
+        style={{
+          width: "100%", padding: "14px 18px", fontSize: 14, fontFamily: font,
+          background: C.card, border: `1px solid ${C.border}`, borderRadius: 10,
+          color: C.text, outline: "none", marginBottom: 16,
+        }}
+      />
+      <button
+        onClick={() => name.trim() && setScreen("exam")}
+        disabled={!name.trim()}
+        style={{
+          width: "100%", padding: "14px", fontSize: 15, fontWeight: 700, fontFamily: font,
+          background: name.trim() ? C.accent : C.border, color: "#fff",
+          border: "none", borderRadius: 10,
+          cursor: name.trim() ? "pointer" : "default",
+          opacity: name.trim() ? 1 : 0.5,
+        }}
+      >
+        Iniciar Simulado
+      </button>
+    </div>
+  </div>
+);
+```
+
+}
+
+// ─── RESULTS ────────────────────────────────────────────────────────────────
+
+if (screen === “results”) {
+const concept = combinedPct >= 90 ? “A” : combinedPct >= 70 ? “B” : combinedPct >= 50 ? “C” : “D”;
+const conceptInfo = {
+A: { label: “Excelente”, color: C.green },
+B: { label: “Bom”, color: C.accent },
+C: { label: “Regular”, color: C.amber },
+D: { label: “Insuficiente”, color: C.red },
+};
+
+```
+return (
+  <div style={{ fontFamily: font, background: C.bg, color: C.text, minHeight: "100vh", padding: 24 }}>
+    <div style={{ maxWidth: 700, margin: "0 auto" }}>
+      {/* Score card */}
+      <div style={{
+        background: C.card, borderRadius: 16, padding: 32,
+        border: `1px solid ${C.border}`, marginBottom: 24, textAlign: "center",
+      }}>
+        <div style={{ fontSize: 11, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>
+          Resultado Final — {name}
+        </div>
+        <div style={{
+          fontSize: 56, fontWeight: 900, color: conceptInfo[concept].color,
+          lineHeight: 1, margin: "16px 0 4px",
+        }}>
+          {combinedPct}%
+        </div>
+        <div style={{ fontSize: 14, color: C.muted, marginBottom: 20 }}>
+          Conceito <strong style={{ color: conceptInfo[concept].color }}>{concept}</strong> — {conceptInfo[concept].label}
+        </div>
+
+        {/* Breakdown */}
+        <div style={{ display: "flex", gap: 16, justifyContent: "center", flexWrap: "wrap", marginBottom: 24 }}>
+          <div style={{
+            background: C.bgAlt, borderRadius: 10, padding: "14px 24px",
+            border: `1px solid ${C.border}`, minWidth: 160,
+          }}>
+            <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", marginBottom: 6 }}>Teórica (40%)</div>
+            <div style={{ fontSize: 22, fontWeight: 800 }}>{theoryScore}/{theoryTotal}</div>
+            <div style={{ fontSize: 12, color: C.muted }}>{theoryPct}% de acerto</div>
+          </div>
+          <div style={{
+            background: C.bgAlt, borderRadius: 10, padding: "14px 24px",
+            border: `1px solid ${C.border}`, minWidth: 160,
+          }}>
+            <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", marginBottom: 6 }}>Prática (60%)</div>
+            <div style={{ fontSize: 22, fontWeight: 800 }}>{codeEarnedPoints}/{codeMaxPoints}</div>
+            <div style={{ fontSize: 12, color: C.muted }}>{Math.round(codeEarnedPoints/codeMaxPoints*100)}% da pontuação</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 12, justifyContent: "center" }}>
+          <button onClick={resetAll} style={{
+            padding: "10px 24px", fontSize: 13, fontWeight: 600, fontFamily: font,
+            background: C.accent, color: "#fff", border: "none", borderRadius: 8, cursor: "pointer",
+          }}>Refazer Simulado</button>
+        </div>
+      </div>
+
+      {/* Theory Review */}
+      <h3 style={{ fontSize: 14, fontWeight: 700, color: C.muted, margin: "32px 0 16px", textTransform: "uppercase", letterSpacing: 1 }}>
+        Revisão — Questões Teóricas
+      </h3>
+      {THEORY_QUESTIONS.map((q, i) => {
+        const isCorrect = theoryAnswers[q.id] === q.correct;
+        return (
+          <div key={q.id} style={{
+            background: C.card, borderRadius: 12, padding: 18, marginBottom: 10,
+            border: `1px solid ${isCorrect ? C.greenBorder : C.redBorder}`,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <Pill color={C.muted} bg="transparent">{q.topic}</Pill>
+              <span style={{
+                fontSize: 11, fontWeight: 700, padding: "2px 10px", borderRadius: 20,
+                background: isCorrect ? C.greenSoft : C.redSoft,
+                color: isCorrect ? C.green : C.red,
+              }}>{isCorrect ? "✓" : "✗"}</span>
+            </div>
+            <p style={{ fontSize: 13, lineHeight: 1.5, margin: "0 0 6px" }}>{i+1}. {q.question}</p>
+            {!isCorrect && (
+              <p style={{ fontSize: 12, color: C.green, margin: "0 0 4px" }}>
+                ✓ {q.options[q.correct]}
+              </p>
+            )}
+            <p style={{ fontSize: 11, color: C.muted, margin: "6px 0 0", lineHeight: 1.5,
+              padding: 10, background: C.bgAlt, borderRadius: 6 }}>
+              {q.explanation}
+            </p>
+          </div>
+        );
+      })}
+
+      {/* Code Review */}
+      <h3 style={{ fontSize: 14, fontWeight: 700, color: C.muted, margin: "32px 0 16px", textTransform: "uppercase", letterSpacing: 1 }}>
+        Revisão — Desafios de Código
+      </h3>
+      {CODE_CHALLENGES.map((ch) => {
+        const ev = codeEvals[ch.id];
+        const statusColor = ev?.status === "correto" ? C.green : ev?.status === "parcial" ? C.amber : C.red;
+        return (
+          <div key={ch.id} style={{
+            background: C.card, borderRadius: 12, padding: 18, marginBottom: 10,
+            border: `1px solid ${ev?.status === "correto" ? C.greenBorder : ev?.status === "parcial" ? "rgba(251,191,36,0.3)" : C.redBorder}`,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700 }}>{ch.title}</span>
+              <span style={{ fontSize: 13, fontWeight: 800, color: statusColor }}>
+                {ev?.points || 0}/{ch.points}
+              </span>
+            </div>
+            {ev?.feedback && (
+              <p style={{ fontSize: 12, color: C.muted, margin: "0 0 10px", lineHeight: 1.5,
+                padding: 10, background: C.bgAlt, borderRadius: 6 }}>
+                {ev.feedback}
+              </p>
+            )}
+            {ev?.testResults && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {ev.testResults.map((t, idx) => (
+                  <div key={idx} style={{
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                    fontSize: 11, padding: "4px 8px", borderRadius: 4,
+                    background: t.passed ? C.greenSoft : C.redSoft,
+                    color: t.passed ? C.green : C.red,
+                  }}>
+                    <span>{t.passed ? "✓" : "✗"} {t.name}</span>
+                    <span style={{ fontWeight: 700 }}>{t.passed ? `+${t.pts}` : "0"}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  </div>
+);
+```
+
+}
+
+// ─── EXAM ───────────────────────────────────────────────────────────────────
+
+const isEvaluatingAny = Object.values(evaluating).some(Boolean);
+
+return (
+<div style={{ fontFamily: font, background: C.bg, color: C.text, minHeight: “100vh”, padding: 24 }}>
+<div style={{ maxWidth: 720, margin: “0 auto” }}>
+{/* Nav */}
+<div style={{
+position: “sticky”, top: 0, zIndex: 10, background: C.bg,
+padding: “8px 0 14px”, borderBottom: `1px solid ${C.border}`, marginBottom: 20,
+}}>
+<div style={{ display: “flex”, justifyContent: “space-between”, alignItems: “center”, marginBottom: 12 }}>
+<div>
+<span style={{ fontSize: 15, fontWeight: 700, color: C.accent }}>Simulado</span>
+<span style={{ fontSize: 12, color: C.muted, marginLeft: 10 }}>{name}</span>
+</div>
+<button
+onClick={submitExam}
+disabled={!canFinish || isEvaluatingAny}
+style={{
+padding: “8px 20px”, fontSize: 13, fontWeight: 700, fontFamily: font,
+background: canFinish && !isEvaluatingAny ? C.green : C.border,
+color: “#fff”, border: “none”, borderRadius: 8,
+cursor: canFinish && !isEvaluatingAny ? “pointer” : “default”,
+opacity: canFinish && !isEvaluatingAny ? 1 : 0.5,
+}}
+>
+{isEvaluatingAny ? “Avaliando…” : “Finalizar Simulado”}
+</button>
+</div>
+
+```
+      <div style={{ display: "flex", gap: 10 }}>
+        <div onClick={() => setSection("theory")} style={{ cursor: "pointer" }}>
+          <SectionBadge number="1" label={`Teórica (${theoryAnswered}/${theoryTotal})`} active={section === "theory"} />
+        </div>
+        <div onClick={() => setSection("code")} style={{ cursor: "pointer" }}>
+          <SectionBadge number="2" label="Prática (Código)" active={section === "code"} />
+        </div>
+      </div>
+    </div>
+
+    {/* THEORY SECTION */}
+    {section === "theory" && (
+      <div>
+        {THEORY_QUESTIONS.map((q, i) => (
+          <div key={q.id} style={{
+            background: C.card, borderRadius: 14, padding: 22, marginBottom: 14,
+            border: `1px solid ${theoryAnswers[q.id] !== undefined ? C.accentGlow : C.border}`,
+            transition: "border-color 0.2s",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+              <Pill>{q.topic}</Pill>
+              <span style={{ fontSize: 12, color: C.dim }}>Q{i + 1}</span>
+            </div>
+            <p style={{ fontSize: 14, lineHeight: 1.6, margin: "0 0 14px" }}>{q.question}</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+              {q.options.map((opt, idx) => {
+                const sel = theoryAnswers[q.id] === idx;
+                return (
+                  <button
+                    key={idx}
+                    onClick={() => setTheoryAnswers(p => ({ ...p, [q.id]: idx }))}
+                    style={{
+                      display: "flex", alignItems: "flex-start", gap: 11,
+                      padding: "11px 15px", fontSize: 13, lineHeight: 1.5, fontFamily: font,
+                      background: sel ? C.accentSoft : "transparent",
+                      color: sel ? C.accent : C.text,
+                      border: `1px solid ${sel ? C.accent : C.border}`,
+                      borderRadius: 9, cursor: "pointer", textAlign: "left",
+                      transition: "all 0.15s",
+                    }}
+                  >
+                    <span style={{
+                      width: 22, height: 22, minWidth: 22, borderRadius: "50%",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      fontSize: 11, fontWeight: 700,
+                      background: sel ? C.accent : "transparent",
+                      color: sel ? "#fff" : C.dim,
+                      border: sel ? "none" : `1px solid ${C.border}`,
+                    }}>{String.fromCharCode(65 + idx)}</span>
+                    <span>{opt}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <div style={{ textAlign: "center", padding: "16px 0 32px" }}>
+          <button
+            onClick={() => setSection("code")}
+            style={{
+              padding: "12px 32px", fontSize: 14, fontWeight: 700, fontFamily: font,
+              background: C.card, color: C.accent, border: `1px solid ${C.accent}`,
+              borderRadius: 10, cursor: "pointer",
+            }}
+          >
+            Ir para Parte Prática →
+          </button>
+        </div>
+      </div>
+    )}
+
+    {/* CODE SECTION */}
+    {section === "code" && (
+      <div>
+        {CODE_CHALLENGES.map((ch, i) => {
+          const ev = codeEvals[ch.id];
+          const isEval = evaluating[ch.id];
+          return (
+            <div key={ch.id} style={{
+              background: C.card, borderRadius: 14, padding: 22, marginBottom: 16,
+              border: `1px solid ${ev ? (ev.status === "correto" ? C.greenBorder : ev.status === "parcial" ? "rgba(251,191,36,0.3)" : C.redBorder) : C.border}`,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div>
+                  <Pill color={C.green} bg={C.greenSoft}>Desafio {i + 1}</Pill>
+                  <span style={{ fontSize: 13, fontWeight: 700, marginLeft: 10 }}>{ch.title}</span>
+                </div>
+                <span style={{ fontSize: 12, color: C.muted }}>{ch.points} pts</span>
+              </div>
+              <p style={{
+                fontSize: 12, color: C.muted, lineHeight: 1.7, margin: "0 0 14px",
+                padding: 12, background: C.bgAlt, borderRadius: 8, whiteSpace: "pre-wrap",
+              }}>
+                {ch.description}
+              </p>
+              <textarea
+                value={codeAnswers[ch.id]}
+                onChange={e => setCodeAnswers(p => ({ ...p, [ch.id]: e.target.value }))}
+                spellCheck={false}
+                style={{
+                  width: "100%", minHeight: 200, padding: 16, fontSize: 13,
+                  fontFamily: C.codeFont, lineHeight: 1.6,
+                  background: C.codeBg, color: "#a5d6ff", border: `1px solid ${C.border}`,
+                  borderRadius: 10, resize: "vertical", outline: "none",
+                  boxSizing: "border-box",
+                }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
+                <button
+                  onClick={() => evaluateCode(ch.id)}
+                  disabled={isEval}
+                  style={{
+                    padding: "8px 20px", fontSize: 12, fontWeight: 600, fontFamily: font,
+                    background: isEval ? C.border : C.bgAlt,
+                    color: isEval ? C.muted : C.accent,
+                    border: `1px solid ${isEval ? C.border : C.accent}`,
+                    borderRadius: 8, cursor: isEval ? "default" : "pointer",
+                  }}
+                >
+                  {isEval ? "⏳ Avaliando..." : "▶ Testar código"}
+                </button>
+                {ev && (
+                  <span style={{
+                    fontSize: 12, fontWeight: 700,
+                    color: ev.status === "correto" ? C.green : ev.status === "parcial" ? C.amber : C.red,
+                  }}>
+                    {ev.points}/{ch.points} pts — {ev.status === "correto" ? "✓ Correto" : ev.status === "parcial" ? "◐ Parcial" : "✗ Incorreto"}
+                  </span>
+                )}
+              </div>
+              {ev?.feedback && (
+                <div style={{ margin: "10px 0 0" }}>
+                  <p style={{
+                    fontSize: 12, color: C.muted, margin: "0 0 8px", lineHeight: 1.5,
+                    padding: 10, background: C.bgAlt, borderRadius: 6,
+                  }}>
+                    💬 {ev.feedback}
+                  </p>
+                  {ev.testResults && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {ev.testResults.map((t, idx) => (
+                        <span key={idx} style={{
+                          fontSize: 10, padding: "3px 8px", borderRadius: 4,
+                          background: t.passed ? C.greenSoft : C.redSoft,
+                          color: t.passed ? C.green : C.red,
+                          whiteSpace: "nowrap",
+                        }}>
+                          {t.passed ? "✓" : "✗"} {t.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        <div style={{ textAlign: "center", padding: "16px 0 32px" }}>
+          <button
+            onClick={() => setSection("theory")}
+            style={{
+              padding: "10px 24px", fontSize: 13, fontWeight: 600, fontFamily: font,
+              background: "transparent", color: C.muted,
+              border: `1px solid ${C.border}`, borderRadius: 8, cursor: "pointer",
+              marginRight: 12,
+            }}
+          >
+            ← Voltar à Teórica
+          </button>
+          <button
+            onClick={submitExam}
+            disabled={!canFinish || isEvaluatingAny}
+            style={{
+              padding: "12px 36px", fontSize: 15, fontWeight: 700, fontFamily: font,
+              background: canFinish && !isEvaluatingAny ? `linear-gradient(135deg, ${C.accent}, ${C.green})` : C.border,
+              color: "#fff", border: "none", borderRadius: 10,
+              cursor: canFinish && !isEvaluatingAny ? "pointer" : "default",
+              opacity: canFinish && !isEvaluatingAny ? 1 : 0.5,
+              boxShadow: canFinish ? `0 4px 24px ${C.accentGlow}` : "none",
+            }}
+          >
+            {isEvaluatingAny ? "Avaliando código..." : "Finalizar Simulado"}
+          </button>
+        </div>
+      </div>
+    )}
+  </div>
+</div>
+```
+
+);
+}
+
+const root = ReactDOM.createRoot(document.getElementById(“root”));
+root.render(<App />);
+</script>
+
+</body>
+</html>
